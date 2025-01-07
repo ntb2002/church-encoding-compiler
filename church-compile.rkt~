@@ -1,0 +1,180 @@
+#lang racket
+
+
+;; Assignment 4: A church-compiler for Scheme, to Lambda-calculus
+;; IMMEDIATELY read the README, please
+
+(provide church-compile
+         ; provided conversions, used by test scripts:
+         church->nat
+         church->bool
+         church->listof)
+
+;; Input language:
+;
+; e ::= (letrec ([x (lambda (x ...) e)]) e)    
+;     | (let ([x e] ...) e)  
+;     | (let* ([x e] ...) e)
+;     | (lambda (x ...) e)
+;     | (e e ...)    
+;     | x  
+;     | (and e ...) | (or e ...)
+;     | (if e e e)
+;     | (prim e) | (prim e e)
+;     | datum
+; datum ::= nat | (quote ()) | #t | #f 
+; nat ::= 0 | 1 | 2 | ... 
+; x is a symbol
+; prim is a primitive operation in list prims
+; The following are *extra credit*: -, =, sub1
+(define prims '(+ * - = add1 sub1 cons car cdr null? not zero?))
+
+; This input language has semantics identical to Scheme / Racket, except:
+;   + You will not be provided code that yields any kind of error in Racket
+;   + You do not need to treat non-boolean values as #t at if, and, or forms
+;   + primitive operations are either strictly unary (add1 sub1 null? zero? not car cdr), 
+;                                           or binary (+ - * = cons)
+;   + There will be no variadic functions or applications---but any fixed arity is allowed
+
+;; Output language:
+
+; e ::= (lambda (x) e)
+;     | (e e)
+;     | x
+;
+; also as interpreted by Racket
+
+
+;; Using the following decoding functions:
+
+; A church-encoded nat is a function taking an f, and x, returning (f^n x)
+(define (church->nat c-nat)
+  ((c-nat add1) 0))
+
+; A church-encoded bool is a function taking a true-thunk and false-thunk,
+;   returning (true-thunk) when true, and (false-thunk) when false
+(define (church->bool c-bool)
+  ((c-bool (lambda (_) #t)) (lambda (_) #f)))
+
+; A church-encoded cons-cell is a function taking a when-cons callback, and a when-null callback (thunk),
+;   returning when-cons applied on the car and cdr elements
+; A church-encoded cons-cell is a function taking a when-cons callback, and a when-null callback (thunk),
+;   returning the when-null thunk, applied on a dummy value (arbitrary value that will be thrown away)
+(define ((church->listof T) c-lst)
+  ; when it's a pair, convert the element with T, and the tail with (church->listof T)
+  ((c-lst (lambda (a) (lambda (b) (cons (T a) ((church->listof T) b)))))
+   ; when it's null, return Racket's null
+   (lambda (_) '())))
+
+
+;; Write your church-compiling code below:
+
+; churchify recursively walks the AST and converts each expression in the input language (defined above)
+;   to an equivalent (when converted back via each church->XYZ) expression in the output language (defined above)
+
+(define (gen-n n)
+  (define (h x)
+    (if (= x 0) 'x `(f ,(h (sub1 x)))))
+  `(lambda (f) (lambda (x) ,(h n))))
+
+;; + * - = add1 sub1 cons car cdr null? not zero?
+
+(define church:+ `(lambda (n0) (lambda (n1) (lambda (f) (lambda (x) ((n1 f) ((n0 f) x)))))))
+(define church:* `(lambda (n0 n1) (lambda (f) (lambda (x) ((n0 (n1 f)) x)))))
+(define church:- `(lambda (a) (lambda (b)((b (lambda (b)(lambda (c)(lambda (d)(((b (lambda (e) (lambda (h) (h (e c)))))(lambda (y) d))(lambda (y) y)))))) a))))
+(define Y-comb `((lambda (u) (u u)) (lambda (y) (lambda (mk) (mk (lambda (x) (((y y) mk) x)))))))
+(define church:not `(lambda (bool) (if bool #f #t)))
+(define church:length `(lambda (f)
+                         (lambda (lst)
+                           (if (empty? lst)
+                               0
+                               (add1 (f (rest lst)))))))
+(define church:add1 '(lambda (N) (lambda (f) (lambda (x) (f ((N f) x))))))
+(define church:cons `(lambda (a b) (lambda (when-cons when-null) (when-cons a b))))
+(define church:car 'todo)
+(define church:cdr 'todo)
+(define church:zero? 'todo)
+(define church:= 'todo)
+
+;;(define church:null? `((lambda (a) (a (lambda (b c) #f) (lambda (_) #t)))))
+
+(define (churchify e)
+  ;;(displayln e)
+  (match e
+    ;; Letrec
+    [`(letrec ([,f (lambda (,args ...) ,e0)]) ,e1)
+     (churchify `(let ([,f (Y-comb (lambda (,f) (lambda ,args ,e0)))]) ,e1))]
+    ;; cons
+    [`cons (churchify '(lambda (x y) (lambda (f z) (f x y))))]
+    ;; List
+    ['() (churchify '(lambda (when-cons when-null) (when-null)))]
+    [''() (churchify '(lambda (when-cons when-null) (when-null)))]
+    ;; Bool
+    [#t (churchify '(lambda (t f) (t)))]
+    [#f (churchify '(lambda (t f) (f)))]   
+    ;; Let 
+    [`(let () ,e1) (churchify e1)] ;; churchify e1, same for let*
+    ;; 1 or more binding let
+    [`(let ([,es ,eas] ...) ,e-b)
+     (churchify `((lambda ,es ,e-b) ,@eas))]
+    ;; let* 
+    [`(let* ([,x0 ,e0] ,rest ...) ,e1) (churchify `(let ([,x0 ,e0]) (let* ,rest ,e1)))]
+    [`(let* () ,e1) (churchify e1)]
+    ;; and
+    [`(and) (churchify '#t)]
+    [`(and ,e) e]
+    [`(and ,e0 ,rest ...) (churchify `(if ,e0 (and ,@rest) #f))]
+    ;; or
+    [`(or) (churchify '#f)]
+    [`(or ,e0 ,rest ...) (churchify `(if ,e0 #t (or ,@rest)))]
+    ;; not
+    [`(not ,x) (churchify `(church:not ,x))]
+    ;; conditional expressions (see slides)
+    [`(if ,e0 ,e1 ,e2) (churchify `((,e0 (lambda (_) ,e1)) (lambda (_) ,e2)))]
+    ;; car and cdr 
+    [`(car ,lst) `((,(churchify lst) (lambda (b) (lambda (c) b))) (lambda (_) a))] 
+    [`(cdr ,lst) `((,(churchify lst) (lambda (b) (lambda (c) c))) (lambda (_) a))]   
+    ;; Add
+    [`(+ ,e0 ,e1) `((,church:+ ,(churchify e0)) ,(churchify e1))]
+    ;; *
+    [`(* ,e0 ,e1) `(,church:* ,(churchify e0) ,(churchify e1))]
+    ;; Subtract
+    [`(- ,e0 ,e1) `((,church:- ,(churchify e0)) ,(churchify e1))]
+    ;; = Equals
+   ;; [`(= ,e0 ,e1) `(,church:= ,(churchify e0) ,(churchify e1))]
+    ;; add1
+    [`(add1 ,e)
+     `(,church:add1 ,(churchify e))]
+    ;; null 
+    [`(null? ,x) (churchify `((lambda (a) (a (lambda (b c) #f) (lambda (_) #t))) ,x))]
+    ;; [`(null?, e) (,church:null? ,(churchify e))]
+    ;; number
+    [(? number? x) (gen-n x)]
+    ;; Datums
+    [(? natural? nat)
+     (define (wrap nat)
+       (if (= 0 nat) 'x `(f ,(wrap (- nat 1)))))
+     (churchify `(lambda (f) (lambda (x) ,(wrap nat))))]
+    ;; symbol
+    [(? symbol? x) x]
+    ;; Zero for Factorial Bonus
+    [`(zero? ,x) (churchify `((lambda (n) (n (lambda (_) #f) #t)) ,x))]
+    ;;lambda
+    [`(lambda () ,y)
+     `((lambda (_) ,(churchify y)) (lambda (x) x))]
+    [`(lambda (,x) ,y)
+     `(lambda (,x) ,(churchify y))]
+    [`(lambda (,x . ,rest) ,y)
+     (churchify `(lambda (,x) (lambda ,rest ,y)))]
+    ;; From Slack
+    [`(,e) `(,(churchify e) (lambda (x) x))]
+    [`(,e ,e0) `(,(churchify e) ,(churchify e0))]
+    [`(,e-f ,e0 ,e-rst ...)
+     (churchify `((,e-f ,e0) ,@e-rst))]
+    ))
+
+;; Church Compiler
+(define (church-compile e)
+  (churchify
+   `(let ([Y-comb ,Y-comb] [church:not ,church:not]),e)))
+
